@@ -188,7 +188,7 @@ jobs:
       - name: Deploy staging
         env:
           IMAGES_JSON: ${{ needs.build.outputs.images }}
-          #INVENTORY_API_TOKEN: ${{ secrets.INVENTORY_API_TOKEN }}
+          INVENTORY_API_TOKEN: ${{ secrets.INVENTORY_API_TOKEN }}
           NOTIFICATIONS_API_TOKEN: ${{ secrets.NOTIFICATIONS_API_TOKEN }}
         run: |
           export INVENTORY_IMAGE=$(echo "$IMAGES_JSON" | jq -r '.inventory // empty')
