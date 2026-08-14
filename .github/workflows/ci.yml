@@ -123,7 +123,7 @@ jobs:
 
           for dir in ${{ needs.test.outputs.services }}; do
             service=$(basename "$dir")
-            tag="ghcr.io/$OWNER/$service:${{ github.sha }}"
+            tag="ghcr.io/$OWNER/practice/$service:${{ github.sha }}"
 
             echo "::group::build $service"
             docker build -f "$dir/Dockerfile" -t "$tag" .
