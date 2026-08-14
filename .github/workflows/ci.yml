@@ -1,0 +1,336 @@
+name: CI
+
+# Actions are pinned to commit SHAs, not tags. A tag like @v4 can be moved to a
+# different commit by whoever owns the action, which would silently change what
+# runs in this pipeline. 
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# Least privilege by default: only the job that publishes images gets write
+# access to packages.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      services: ${{ steps.affected.outputs.services }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # checkout v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # setup-node v4
+        with:
+          node-version-file: starter/.nvmrc
+
+      - name: Determine affected packages
+        id: affected
+        working-directory: starter
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE_SHA="${{ github.event.before }}"
+
+            # case if it's the first commit, (this can be better)
+            if [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+              BASE_SHA="origin/main"
+            fi
+          fi
+          HEAD_SHA="${{ github.sha }}"
+
+          echo "Base: $BASE_SHA"
+          echo "Head: $HEAD_SHA"
+
+          CHANGED_FILES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          echo "--- changed files ---"
+          echo "$CHANGED_FILES"
+
+          RESULT=$(node scripts/affected-packages.js $CHANGED_FILES)
+          echo "--- affected-packages.js output ---"
+          echo "$RESULT"
+
+          PACKAGES=$(echo "$RESULT" | jq -r '.affectedPackages | join(" ")')
+          SERVICES=$(echo "$RESULT" | jq -r '.affectedServices | join(" ")')
+
+          echo "packages=$PACKAGES" >> "$GITHUB_OUTPUT"
+          echo "services=$SERVICES" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        working-directory: starter
+        run: npm ci
+
+      # Fails on high and critical only. Moderate findings stay visible in the
+      # log but do not block, otherwise the gate gets bypassed and stops meaning
+      # anything.
+      - name: Audit dependencies
+        working-directory: starter
+        run: npm audit --audit-level=high
+
+      - name: Run tests for affected packages
+        working-directory: starter
+        run: |
+          echo "Testing: ${{ steps.affected.outputs.packages }}"
+          FLAGS=""
+          for pkg in ${{ steps.affected.outputs.packages }}; do
+            FLAGS="$FLAGS -w $pkg"
+          done
+          npm test $FLAGS
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: needs.test.outputs.services != ''
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      images: ${{ steps.publish.outputs.images }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # checkout v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # login-action v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Scanning happens between build and push, so an image that fails the
+      # policy never reaches the registry. Trivy runs as a container for the
+      # same reason Terraform does: the version is pinned here, not inherited
+      # from the runner.
+      - name: Build, scan and push affected service images
+        id: publish
+        working-directory: starter
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          images='{}'
+
+          for dir in ${{ needs.test.outputs.services }}; do
+            service=$(basename "$dir")
+            tag="ghcr.io/$OWNER/$service:${{ github.sha }}"
+
+            echo "::group::build $service"
+            docker build -f "$dir/Dockerfile" -t "$tag" .
+            echo "::endgroup::"
+
+            echo "::group::scan $service"
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "${{ github.workspace }}/.trivyignore:/.trivyignore:ro" \
+              aquasec/trivy:0.73.0 image \
+              --exit-code 1 \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              --ignorefile /.trivyignore \
+              "$tag"
+            echo "::endgroup::"
+
+            docker push "$tag"
+
+            # The digest only exists once the image is in the registry, so it is
+            # captured here and handed to the deploy job. Services this run did
+            # not rebuild get their digest from terraform.tfvars instead.
+            digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$tag")
+            echo "$service -> $digest"
+            images=$(echo "$images" | jq --arg s "$service" --arg d "$digest" '. + {($s): $d}')
+          done
+
+          echo "images=$(echo "$images" | jq -c .)" >> "$GITHUB_OUTPUT"
+
+  deploy-staging:
+    needs: [test, build]
+    if: needs.test.outputs.services != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # No protection rules here — declaring the environment is what gives the job
+    # access to this environment's secrets, so staging and prod use different
+    # API tokens.
+    environment: staging
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # checkout v4
+
+      # floci pulls images through the host Docker daemon, so this VM needs its
+      # own registry credentials, the build job's login lives on another VM.
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # login-action v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Every step below is a make target a developer also runs locally, so there
+      # is no CI-only path that can drift from what was tested by hand.
+      - name: Start floci-gcp
+        run: make floci-up
+
+      # Only the services this run rebuilt get an image here. The rest keep what
+      # infra/envs/staging/terraform.tfvars pins.
+      - name: Deploy staging
+        env:
+          IMAGES_JSON: ${{ needs.build.outputs.images }}
+          INVENTORY_API_TOKEN: ${{ secrets.INVENTORY_API_TOKEN }}
+          NOTIFICATIONS_API_TOKEN: ${{ secrets.NOTIFICATIONS_API_TOKEN }}
+        run: |
+          export INVENTORY_IMAGE=$(echo "$IMAGES_JSON" | jq -r '.inventory // empty')
+          export NOTIFICATIONS_IMAGE=$(echo "$IMAGES_JSON" | jq -r '.notifications // empty')
+          export ORDERS_IMAGE=$(echo "$IMAGES_JSON" | jq -r '.orders // empty')
+          make deploy ENV=staging
+
+      - name: Integration tests
+        run: make integration-test ENV=staging
+
+      - name: Negative path — services fail closed without their secrets
+        run: make test-secrets
+
+      - name: Emulator logs on failure
+        if: failure()
+        run: docker logs floci-gcp
+
+  # The single check the branch rule requires. build and deploy-staging are
+  # skipped when nothing is affected, and a skipped required check leaves a pull
+  # request pending for ever, so the rule points here instead of at them.
+  ci-ok:
+    needs: [test, build, deploy-staging]
+    if: '!cancelled()'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail unless every job passed or was skipped
+        run: |
+          echo "test:           ${{ needs.test.result }}"
+          echo "build:          ${{ needs.build.result }}"
+          echo "deploy-staging: ${{ needs['deploy-staging'].result }}"
+
+          for result in "${{ needs.test.result }}" \
+                        "${{ needs.build.result }}" \
+                        "${{ needs['deploy-staging'].result }}"; do
+            case "$result" in
+              success | skipped) ;;
+              *) echo "a job did not pass" >&2; exit 1 ;;
+            esac
+          done
+
+  # Without this the tfvars would only hold the images of services that were not
+  # rebuilt, so it would drift further from reality on every deploy. On a
+  # persistent environment that is a real bug: a deploy that changed one service
+  # would push the others back to the older image the file still pinned.
+  update-manifest:
+    needs: [build, deploy-staging]
+
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to push the bot branch — never main, which stays protected
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # checkout v4
+        with:
+          ref: main
+
+      - name: Record the digests that were deployed
+        env:
+          IMAGES_JSON: ${{ needs.build.outputs.images }}
+        run: |
+          export INVENTORY_IMAGE=$(echo "$IMAGES_JSON" | jq -r '.inventory // empty')
+          export NOTIFICATIONS_IMAGE=$(echo "$IMAGES_JSON" | jq -r '.notifications // empty')
+          export ORDERS_IMAGE=$(echo "$IMAGES_JSON" | jq -r '.orders // empty')
+          ./scripts/set-images.sh staging
+
+      # A manifest change reaches main the same way any other change does: through
+      # a pull request. Always the same branch, so repeated deploys update one
+      # pull request instead of opening a new one each time.
+      - name: Open or update the manifest pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --quiet infra/envs/staging/terraform.tfvars; then
+            echo "manifest already matches what is deployed"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout -B chore/staging-manifest
+          git add infra/envs/staging/terraform.tfvars
+          git commit -m "Record deployed staging digests"
+          git push --force origin chore/staging-manifest
+
+          # Only an open pull request skips the create, a merged one must not.
+          OPEN=$(gh pr list --head chore/staging-manifest --state open --json number --jq '.[].number')
+
+          if [ -n "$OPEN" ]; then
+            echo "pull request #$OPEN is already open, it now has the new digests"
+          else
+            gh pr create --base main --head chore/staging-manifest \
+              --title "Record deployed staging digests" \
+              --body "Staging now runs these digests. Merging keeps the manifest in step with what is deployed, so services this pipeline does not rebuild are pinned to their current image rather than an older one."
+          fi
+
+  deploy-prod:
+    needs: [test, build, deploy-staging]
+    # A promotion only edits the prod manifest, so nothing is affected and both
+    # build and deploy-staging are skipped. Without !cancelled() a skipped need
+    # would skip this job too, and the promotion would never reach prod. The
+    # result checks keep the gate: a job that failed still stops it.
+    if: >-
+      !cancelled()
+      && github.ref == 'refs/heads/main'
+      && needs.test.result == 'success'
+      && (needs.build.result == 'success' || needs.build.result == 'skipped')
+      && (needs['deploy-staging'].result == 'success' || needs['deploy-staging'].result == 'skipped')
+    runs-on: ubuntu-latest
+    # GitHub holds this job until a reviewer approves it.
+    environment: production
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # checkout v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # login-action v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Start floci-gcp
+        run: make floci-up
+
+      # No IMAGE_TAG on purpose: prod deploys exactly what
+      # infra/envs/prod/terraform.tfvars pins, and that file only changes through
+      # a reviewed promotion commit (see scripts/promote.sh).
+      - name: Deploy prod
+        env:
+          INVENTORY_API_TOKEN: ${{ secrets.INVENTORY_API_TOKEN }}
+          NOTIFICATIONS_API_TOKEN: ${{ secrets.NOTIFICATIONS_API_TOKEN }}
+        run: make deploy ENV=prod
+
+      - name: Smoke tests
+        run: make integration-test ENV=prod
+
+      - name: Emulator logs on failure
+        if: failure()
+        run: docker logs floci-gcp

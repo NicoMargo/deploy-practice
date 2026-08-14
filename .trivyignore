@@ -1,0 +1,4 @@
+# Documented exceptions to the image scan policy.
+# The `exp:` date is read by Trivy, not by a human: once it passes the finding
+# comes back and fails the build again.
+CVE-2026-45447 exp:2026-09-30

@@ -1,0 +1,16 @@
+{
+  "name": "aceup-devops-homework-starter",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "services/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "lint": "echo \"no root lint configured\""
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
