@@ -44,5 +44,5 @@ seed() {
 
 echo "seeding secrets into project ${PROJECT}"
 # The ids here must match what the services ask Secret Manager for.
-seed inventory-api-token "$INVENTORY_TOKEN"
+#seed inventory-api-token "$INVENTORY_TOKEN"
 seed notifications-api-token "$NOTIFICATIONS_TOKEN"
