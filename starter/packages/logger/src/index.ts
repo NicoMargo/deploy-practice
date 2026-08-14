@@ -1,5 +1,5 @@
 export type LogLevel = "debug" | "info" | "warn" | "error";
-
+//this is a comment 
 export interface Logger {
   debug(message: string, fields?: Record<string, unknown>): void;
   info(message: string, fields?: Record<string, unknown>): void;
