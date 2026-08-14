@@ -135,7 +135,7 @@ jobs:
               -v "${{ github.workspace }}/.trivyignore:/.trivyignore:ro" \
               aquasec/trivy:0.73.0 image \
               --exit-code 1 \
-              --severity HIGH,CRITICAL \
+              --severity MEDIUM,HIGH,CRITICAL \
               --ignore-unfixed \
               --ignorefile /.trivyignore \
               "$tag"
